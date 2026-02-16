@@ -49,6 +49,14 @@ FILE_ENCODING = "utf-8"
 
 FONTS = load_fonts()
 
+HIGHWAY_TYPES_LOGISTICS = {
+    "motorway",
+    "motorway_link",
+    "trunk",
+    "trunk_link",
+}
+HIGHWAY_TYPES_PRIMARY = {"primary", "primary_link"}
+
 
 def _cache_path(key: str) -> str:
     """
@@ -286,7 +294,7 @@ def get_edge_colors_by_type(g):
     return edge_colors
 
 
-def get_edge_widths_by_type(g):
+def get_edge_widths_by_type(g, highways_only=False):
     """
     Assigns line widths to edges based on road type.
     Major roads get thicker lines.
@@ -299,17 +307,28 @@ def get_edge_widths_by_type(g):
         if isinstance(highway, list):
             highway = highway[0] if highway else 'unclassified'
 
-        # Assign width based on road importance
-        if highway in ["motorway", "motorway_link"]:
-            width = 1.2
-        elif highway in ["trunk", "trunk_link", "primary", "primary_link"]:
-            width = 1.0
-        elif highway in ["secondary", "secondary_link"]:
-            width = 0.8
-        elif highway in ["tertiary", "tertiary_link"]:
-            width = 0.6
+        # In logistics mode, emphasize major corridors heavily.
+        if highways_only:
+            if highway in ["motorway", "motorway_link"]:
+                width = 2.2
+            elif highway in ["trunk", "trunk_link"]:
+                width = 1.6
+            elif highway in ["primary", "primary_link"]:
+                width = 1.2
+            else:
+                width = 0.8
         else:
-            width = 0.4
+            # Assign width based on road importance
+            if highway in ["motorway", "motorway_link"]:
+                width = 1.2
+            elif highway in ["trunk", "trunk_link", "primary", "primary_link"]:
+                width = 1.0
+            elif highway in ["secondary", "secondary_link"]:
+                width = 0.8
+            elif highway in ["tertiary", "tertiary_link"]:
+                width = 0.6
+            else:
+                width = 0.4
 
         edge_widths.append(width)
 
@@ -406,7 +425,7 @@ def get_crop_limits(g_proj, center_lat_lon, fig, dist):
     )
 
 
-def fetch_graph(point, dist) -> MultiDiGraph | None:
+def fetch_graph(point, dist, highways_only=False, include_primary=False) -> MultiDiGraph | None:
     """
     Fetch street network graph from OpenStreetMap.
 
@@ -421,14 +440,32 @@ def fetch_graph(point, dist) -> MultiDiGraph | None:
         MultiDiGraph of street network, or None if fetch fails
     """
     lat, lon = point
-    graph = f"graph_{lat}_{lon}_{dist}"
+    road_profile = "all"
+    if highways_only:
+        road_profile = "highways_with_primary" if include_primary else "highways_core"
+
+    graph = f"graph_{lat}_{lon}_{dist}_{road_profile}"
     cached = cache_get(graph)
     if cached is not None:
         print("✓ Using cached street network")
         return cast(MultiDiGraph, cached)
 
     try:
-        g = ox.graph_from_point(point, dist=dist, dist_type='bbox', network_type='all', truncate_by_edge=True)
+        custom_filter = None
+        if highways_only:
+            highway_types = sorted(HIGHWAY_TYPES_LOGISTICS)
+            if include_primary:
+                highway_types.extend(sorted(HIGHWAY_TYPES_PRIMARY))
+            custom_filter = f'["highway"~"{"|".join(highway_types)}"]'
+
+        g = ox.graph_from_point(
+            point,
+            dist=dist,
+            dist_type='bbox',
+            network_type='all',
+            custom_filter=custom_filter,
+            truncate_by_edge=True
+        )
         # Rate limit between requests
         time.sleep(0.5)
         try:
@@ -493,6 +530,8 @@ def create_poster(
     display_city=None,
     display_country=None,
     fonts=None,
+    highways_only=False,
+    highways_include_primary=False,
 ):
     """
     Generate a complete map poster with roads, water, parks, and typography.
@@ -523,8 +562,9 @@ def create_poster(
     print(f"\nGenerating map for {city}, {country}...")
 
     # Progress bar for data fetching
+    fetch_steps = 1 if highways_only else 3
     with tqdm(
-        total=3,
+        total=fetch_steps,
         desc="Fetching map data",
         unit="step",
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}",
@@ -532,30 +572,40 @@ def create_poster(
         # 1. Fetch Street Network
         pbar.set_description("Downloading street network")
         compensated_dist = dist * (max(height, width) / min(height, width)) / 4  # To compensate for viewport crop
-        g = fetch_graph(point, compensated_dist)
+        g = fetch_graph(
+            point,
+            compensated_dist,
+            highways_only=highways_only,
+            include_primary=highways_include_primary,
+        )
         if g is None:
             raise RuntimeError("Failed to retrieve street network data.")
         pbar.update(1)
 
-        # 2. Fetch Water Features
-        pbar.set_description("Downloading water features")
-        water = fetch_features(
-            point,
-            compensated_dist,
-            tags={"natural": ["water", "bay", "strait"], "waterway": "riverbank"},
-            name="water",
-        )
-        pbar.update(1)
+        if highways_only:
+            water = None
+            parks = None
+            print("✓ Highways-only mode: skipping water and parks layers.")
+        else:
+            # 2. Fetch Water Features
+            pbar.set_description("Downloading water features")
+            water = fetch_features(
+                point,
+                compensated_dist,
+                tags={"natural": ["water", "bay", "strait"], "waterway": "riverbank"},
+                name="water",
+            )
+            pbar.update(1)
 
-        # 3. Fetch Parks
-        pbar.set_description("Downloading parks/green spaces")
-        parks = fetch_features(
-            point,
-            compensated_dist,
-            tags={"leisure": "park", "landuse": "grass"},
-            name="parks",
-        )
-        pbar.update(1)
+            # 3. Fetch Parks
+            pbar.set_description("Downloading parks/green spaces")
+            parks = fetch_features(
+                point,
+                compensated_dist,
+                tags={"leisure": "park", "landuse": "grass"},
+                name="parks",
+            )
+            pbar.update(1)
 
     print("✓ All data retrieved successfully!")
 
@@ -594,7 +644,7 @@ def create_poster(
     # Layer 2: Roads with hierarchy coloring
     print("Applying road hierarchy colors...")
     edge_colors = get_edge_colors_by_type(g_proj)
-    edge_widths = get_edge_widths_by_type(g_proj)
+    edge_widths = get_edge_widths_by_type(g_proj, highways_only=highways_only)
 
     # Determine cropping limits to maintain the poster aspect ratio
     crop_xlim, crop_ylim = get_crop_limits(g_proj, point, fig, compensated_dist)
@@ -915,6 +965,19 @@ Examples:
         help="Map radius in meters (default: 18000)",
     )
     parser.add_argument(
+        "--highways-only",
+        action="store_true",
+        help=(
+            "Fetch and render only major highway corridors "
+            "(motorway/trunk) for logistics-focused posters"
+        ),
+    )
+    parser.add_argument(
+        "--highways-include-primary",
+        action="store_true",
+        help="When used with --highways-only, also include primary roads",
+    )
+    parser.add_argument(
         "--width",
         "-W",
         type=float,
@@ -986,6 +1049,10 @@ Examples:
         )
         args.height = 20.0
 
+    if args.highways_include_primary and not args.highways_only:
+        print("⚠ --highways-include-primary requires --highways-only. Ignoring.")
+        args.highways_include_primary = False
+
     available_themes = get_available_themes()
     if not available_themes:
         print("No themes found in 'themes/' directory.")
@@ -1037,6 +1104,8 @@ Examples:
                 display_city=args.display_city,
                 display_country=args.display_country,
                 fonts=custom_fonts,
+                highways_only=args.highways_only,
+                highways_include_primary=args.highways_include_primary,
             )
 
         print("\n" + "=" * 50)
